@@ -1,0 +1,145 @@
+/*
+Step 1: New user registration - account base (account_base)
+- Count the number of created accounts broken down by specific dimensions
+- Base date is the registration session date
+- Join the account table with sessions (session and session_params tables) to extract session date and subscriber country
+*/
+
+WITH account_base AS (
+SELECT
+s.date AS date,
+sp.country AS country,
+a.send_interval AS send_interval,
+a.is_verified AS is_verified,                          -- Verified accounts
+a.is_unsubscribed AS is_unsubscribed,                  -- User unsubscribed
+COUNT(DISTINCT a.id) AS account_cnt,                   -- Count unique created accounts
+0 AS sent_msg,                                         -- Fill email columns with 0 to match the second part of the query
+0 AS open_msg,
+0 AS visit_msg
+FROM `data-analytics-mate.DA.account` a
+JOIN `data-analytics-mate.DA.account_session` ac ON a.id = ac.account_id
+JOIN `data-analytics-mate.DA.session` s ON ac.ga_session_id = s.ga_session_id
+JOIN `data-analytics-mate.DA.session_params` sp ON ac.ga_session_id = sp.ga_session_id  -- Join tables to get dates for various events
+GROUP BY 1, 2, 3, 4, 5                                 -- Group by sequential columns
+),
+
+/*
+Step 2: Email sending data and user interactions (email_base)
+- Count the number of sent, opened, and clicked emails
+- Email send date is the account creation date (s.date) plus the interval of days contained in the es.sent_date field (DATE_ADD)
+- Join email_sent with account, session, and country, and apply LEFT JOIN with opens (email_open) and clicks (email_visit).
+*/
+
+email_base AS (
+SELECT
+DATE_ADD(s.date, INTERVAL es.sent_date DAY) AS date,      -- Calculate the actual email send date
+sp.country AS country,
+a.send_interval AS send_interval,
+a.is_verified AS is_verified,
+a.is_unsubscribed AS is_unsubscribed,
+0 AS account_cnt,
+COUNT(DISTINCT es.id_message) AS sent_msg,
+COUNT(DISTINCT eo.id_message) AS open_msg,
+COUNT(DISTINCT ev.id_message) AS visit_msg               -- Count unique sent messages, opens, and clicks
+FROM `data-analytics-mate.DA.email_sent` es
+JOIN `data-analytics-mate.DA.account` a ON es.id_account = a.id
+JOIN `data-analytics-mate.DA.account_session` ac ON a.id = ac.account_id
+JOIN `data-analytics-mate.DA.session` s ON ac.ga_session_id = s.ga_session_id
+JOIN `data-analytics-mate.DA.session_params` sp ON ac.ga_session_id = sp.ga_session_id
+LEFT JOIN `data-analytics-mate.DA.email_open` eo ON es.id_message = eo.id_message
+LEFT JOIN `data-analytics-mate.DA.email_visit` ev ON es.id_message = ev.id_message          -- Use LEFT JOIN to avoid dropping messages without further actions (open/click)
+GROUP BY 1, 2, 3, 4, 5
+),
+
+/*
+Step 3: Combine both query parts (all_data)
+- Use UNION ALL to combine both query parts
+*/
+
+all_data AS (
+SELECT * FROM account_base
+UNION ALL
+SELECT * FROM email_base
+),
+
+/*
+Step 4: Aggregation (aggregated_data)
+- Sum/combine metrics from both branches for the same dimensions
+*/
+
+aggregated_data AS (
+SELECT
+date,
+country,
+send_interval,
+is_verified,
+is_unsubscribed,
+SUM(account_cnt) AS account_cnt,
+SUM(sent_msg) AS sent_msg,
+SUM(open_msg) AS open_msg,
+SUM(visit_msg) AS visit_msg
+FROM all_data
+GROUP BY 1, 2, 3, 4, 5
+),
+
+/*
+Step 5: Calculate country totals (country_totals)
+- Window function with SUM(...) OVER (PARTITION BY country).
+- Calculate total accounts and sent emails for the entire country
+*/
+
+country_totals AS (
+SELECT
+date,
+country,
+send_interval,
+is_verified,
+is_unsubscribed,
+account_cnt,
+sent_msg,
+open_msg,
+visit_msg,
+SUM(account_cnt) OVER (PARTITION BY country) AS total_country_account_cnt,
+SUM(sent_msg) OVER (PARTITION BY country) AS total_country_sent_cnt
+FROM aggregated_data
+),
+
+/*
+Step 6: Calculate country ranks (ranked_data)
+- Use window functions to rank countries based on previously summed total values
+- Country with the highest number of accounts/emails gets rank 1
+*/
+
+ranked_data AS (
+SELECT *,
+DENSE_RANK() OVER (ORDER BY total_country_account_cnt DESC) AS rank_total_country_account_cnt,
+DENSE_RANK() OVER (ORDER BY total_country_sent_cnt DESC) AS rank_total_country_sent_cnt
+FROM country_totals
+)
+
+/*
+Step 7: Final filtering and sorting
+- Select all required columns
+- Limit final results exclusively to records where the country is in the TOP 10 for accounts OR TOP 10 for sent messages
+- Sort chronologically by date and alphabetically by country for readability
+*/
+
+SELECT
+date,
+country,
+send_interval,
+is_verified,
+is_unsubscribed,
+account_cnt,
+sent_msg,
+open_msg,
+visit_msg,
+total_country_account_cnt,
+total_country_sent_cnt,
+rank_total_country_account_cnt,
+rank_total_country_sent_cnt
+FROM ranked_data
+WHERE rank_total_country_account_cnt <= 10 OR rank_total_country_sent_cnt <= 10
+ORDER BY date DESC, country;
+
+-- END :)
